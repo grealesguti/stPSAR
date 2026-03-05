@@ -88,43 +88,75 @@ def fetch_from_yfinance(ticker: str) -> pd.DataFrame:
     except Exception as e:
         st.warning(f"yfinance failed for {ticker}: {e}")
         return pd.DataFrame()
+def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a ticker dataframe: types, index, sort, dedup."""
+    # Ensure date column exists and is proper datetime (handles date/datetime/str mix)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=False)
+        df = df.dropna(subset=["date"])
+        df = df.sort_values("date")
+        df = df.drop_duplicates(subset=["date"])
+        df.set_index("date", inplace=True)
+
+    # Ensure DatetimeIndex, strip timezone
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    if hasattr(df.index, "tz") and df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
+    # Normalize all OHLCV columns to float
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Drop rows where close is missing
+    df = df.dropna(subset=["close"])
+
+    # Sort index ascending
+    df = df.sort_index()
+
+    return df
+
+
 def load_or_fetch_ticker(ticker: str, force_update: bool = False) -> pd.DataFrame:
     csv_path = DATA_DIR / f"{ticker}_history.csv"
 
+    # ── Try loading from cache ──────────────────────────────────────────────
     if csv_path.exists() and not force_update:
         try:
-            df = pd.read_csv(csv_path, parse_dates=["date"])
-            df = df.dropna(subset=["date", "close"])
-            df = df.sort_values("date")
-            df.set_index("date", inplace=True)
-            df.index = pd.to_datetime(df.index, errors="coerce")  # ← ensure DatetimeIndex
-            if hasattr(df.index, "tz") and df.index.tz is not None:
-                df.index = df.index.tz_localize(None)
-            return df
+            df = pd.read_csv(csv_path)
+            df = _normalize_df(df)
+            if not df.empty:
+                return df
+            st.warning(f"⚠️ Cache for {ticker} was empty after normalization, re-fetching.")
         except Exception as e:
-            st.warning(f"Could not read cache for {ticker}: {e}")
+            st.warning(f"⚠️ Could not read cache for {ticker}: {e}. Re-fetching.")
 
+    # ── Fetch from web ──────────────────────────────────────────────────────
     df = fetch_from_yahooquery(ticker)
     if df.empty:
         df = fetch_from_yfinance(ticker)
 
     if df.empty:
-        st.error(f"❌ Could not fetch data for {ticker}")
+        st.error(f"❌ Could not fetch data for {ticker} from any source.")
         return pd.DataFrame()
 
-    for col in ["open", "high", "low", "close", "volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # ── Normalize ───────────────────────────────────────────────────────────
+    try:
+        df = _normalize_df(df)
+    except Exception as e:
+        st.error(f"❌ Failed to normalize data for {ticker}: {e}")
+        return pd.DataFrame()
 
-    df = df.dropna(subset=["date", "close"])
-    df = df.sort_values("date")
-    df.set_index("date", inplace=True)
-    df.index = pd.to_datetime(df.index, errors="coerce")  # ← ensure DatetimeIndex
-    if hasattr(df.index, "tz") and df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
+    if df.empty:
+        st.error(f"❌ No valid data for {ticker} after normalization.")
+        return pd.DataFrame()
 
-    df.reset_index().to_csv(csv_path, index=False)
-    st.success(f"✅ Saved {len(df)} rows for {ticker}")
+    # ── Save to cache ───────────────────────────────────────────────────────
+    try:
+        df.reset_index().to_csv(csv_path, index=False)
+        st.success(f"✅ Saved {len(df)} rows for {ticker}")
+    except Exception as e:
+        st.warning(f"⚠️ Could not save cache for {ticker}: {e}")
 
     return df
 
@@ -539,6 +571,52 @@ with st.sidebar:
                 )
             if ok:
                 st.success("✅ Message sent! Check your Telegram.")
+            else:
+                st.error(f"❌ Failed: {err}")
+    
+    st.caption("Send live stats for a specific ticker:")
+    stat_ticker = st.selectbox(
+        "Ticker to send", [""] + tickers,
+        key="stat_ticker_select",
+        label_visibility="collapsed"
+    )
+    
+    if st.button("📊 Send ticker stats to Telegram", disabled=not stat_ticker):
+        if not tg_token or not tg_chat_id:
+            st.error("⚠️ Enter both Bot Token and Chat ID first.")
+        elif stat_ticker not in data:
+            st.warning(f"⚠️ No data loaded for {stat_ticker}. Load it first.")
+        else:
+            df = data[stat_ticker]
+            last = df.iloc[-1]
+            prev = df.iloc[-2] if len(df) > 1 else last
+    
+            change_1d = ((last["close"] - prev["close"]) / prev["close"] * 100) if prev["close"] != 0 else 0
+            change_5d = ((last["close"] - df.iloc[-6]["close"]) / df.iloc[-6]["close"] * 100) if len(df) > 5 else 0
+            signal = get_psar_signal(df)
+            streak = get_signal_streak(df)
+            rsi_val = f"{last['rsi']:.1f}" if "rsi" in df.columns and pd.notna(last.get("rsi")) else "N/A"
+            atr_val = f"{last['atr']:.2f}" if "atr" in df.columns and pd.notna(last.get("atr")) else "N/A"
+            date_str = last.name.strftime("%Y-%m-%d") if hasattr(last.name, "strftime") else str(last.name)
+    
+            msg = (
+                f"📊 *{stat_ticker} — Manual Stats Report*\n"
+                f"🗓 Date: `{date_str}`\n\n"
+                f"💰 Close:    `{last['close']:.2f}`\n"
+                f"📈 1D Chg:  `{change_1d:+.2f}%`\n"
+                f"📅 5D Chg:  `{change_5d:+.2f}%`\n\n"
+                f"🔮 PSAR:    {signal}\n"
+                f"🔁 Streak:  `{streak} days`\n"
+                f"📉 RSI:      `{rsi_val}`\n"
+                f"📐 ATR:     `{atr_val}`\n\n"
+                f"📦 Data pts: `{len(df)}`"
+            )
+    
+            with st.spinner(f"Sending stats for {stat_ticker}..."):
+                ok, err = send_telegram_message(tg_token, tg_chat_id, msg)
+    
+            if ok:
+                st.success(f"✅ Stats for {stat_ticker} sent to Telegram!")
             else:
                 st.error(f"❌ Failed: {err}")
     
