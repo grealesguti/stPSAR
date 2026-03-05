@@ -1,22 +1,10 @@
-# Core
 streamlit>=1.35.0
 streamlit-autorefresh>=1.0.1
-
-# Data
 pandas>=2.0.0
 numpy>=1.24.0
-
-# Finance data fetching
 yfinance>=0.2.40
 yahooquery>=2.3.7
-
-# Charting
 plotly>=5.20.0
-
-# Scheduling
 apscheduler>=3.10.4
-
-# Technical indicators (optional but used if available)
-# TA-Lib requires system-level install: https://ta-lib.org/install/
-# pip install TA-Lib  (after installing the C library)
-# ta-lib>=0.4.28
+requests>=2.31.0
+schedule>=1.2.0
