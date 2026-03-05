@@ -1,16 +1,14 @@
-version: "3.9"
-
 services:
   psar:
     build: .
-    container_name: psar_analyzer
+    container_name: stpsar_analyzer
     restart: unless-stopped
     ports:
       - "8502:8502"
     volumes:
-      - ./data:/app/data          # persists cached CSVs across restarts
+      - ./data:/app/data
     environment:
-      - TZ=Europe/Amsterdam       # change to your timezone
+      - TZ=Europe/Amsterdam
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8502/_stcore/health"]
       interval: 30s
