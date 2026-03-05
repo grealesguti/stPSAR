@@ -10,6 +10,7 @@ from pathlib import Path
 import datetime as dt
 import warnings
 from telegram_alerts import check_and_send_alerts
+from scheduler import start_scheduler, get_last_refresh_time
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -456,32 +457,90 @@ with st.sidebar:
 
 
     st.divider()
+    from telegram_alerts import (
+        send_telegram_message, check_and_send_alerts,
+        load_telegram_config, save_telegram_config
+    )
+    
+    # --- inside the sidebar with block ---
+    
+    st.divider()
     st.subheader("🔔 Telegram Alerts")
-
-    tg_token   = st.text_input("Bot Token",   type="password",
-                               value=st.session_state.get("tg_token", ""))
-    tg_chat_id = st.text_input("Chat ID",
-                               value=st.session_state.get("tg_chat_id", ""))
-
-    st.session_state["tg_token"]   = tg_token
-    st.session_state["tg_chat_id"] = tg_chat_id
-
-    alert_on_flip   = st.checkbox("🔁 Alert on signal flip (Buy/Sell)", value=True)
-    alert_on_signal = st.checkbox("📅 Daily signal summary", value=False)
-
+    
+    # Load from txt on first run only
+    if "tg_loaded" not in st.session_state:
+        cfg = load_telegram_config()
+        st.session_state["tg_token"]          = cfg["token"]
+        st.session_state["tg_chat_id"]        = cfg["chat_id"]
+        st.session_state["tg_flip"]           = cfg["alert_on_flip"]
+        st.session_state["tg_daily"]          = cfg["alert_on_signal"]
+        st.session_state["tg_watched"]        = ",".join(cfg["watched_tickers"])
+        st.session_state["tg_loaded"]         = True
+    
+    tg_token = st.text_input(
+        "Bot Token", type="password",
+        value=st.session_state["tg_token"]
+    )
+    tg_chat_id = st.text_input(
+        "Chat ID",
+        value=st.session_state["tg_chat_id"]
+    )
+    alert_on_flip   = st.checkbox("🔁 Alert on signal flip (Buy/Sell)",
+                                   value=st.session_state["tg_flip"])
+    alert_on_signal = st.checkbox("📅 Daily signal summary",
+                                   value=st.session_state["tg_daily"])
     watched_input = st.text_input(
         "Watchlist (leave blank = all tickers)",
-        placeholder="e.g. AAPL, IWDA.AS"
+        placeholder="e.g. AAPL, IWDA.AS",
+        value=st.session_state["tg_watched"]
     )
     watched_tickers = (
         [t.strip().upper() for t in watched_input.split(",") if t.strip()]
         if watched_input else None
     )
-
+    
+    # Persist to session state
+    st.session_state["tg_token"]   = tg_token
+    st.session_state["tg_chat_id"] = tg_chat_id
+    st.session_state["tg_flip"]    = alert_on_flip
+    st.session_state["tg_daily"]   = alert_on_signal
+    st.session_state["tg_watched"] = watched_input
+    
+    colT1, colT2 = st.columns(2)
+    
+    with colT1:
+        if st.button("💾 Save config"):
+            save_telegram_config(
+                token=tg_token,
+                chat_id=tg_chat_id,
+                alert_on_flip=alert_on_flip,
+                alert_on_signal=alert_on_signal,
+                watched_tickers=watched_tickers or []
+            )
+            st.success("Config saved!")
+    
+    with colT2:
+        if st.button("🔄 Reload config"):
+            cfg = load_telegram_config()
+            st.session_state["tg_token"]   = cfg["token"]
+            st.session_state["tg_chat_id"] = cfg["chat_id"]
+            st.session_state["tg_flip"]    = cfg["alert_on_flip"]
+            st.session_state["tg_daily"]   = cfg["alert_on_signal"]
+            st.session_state["tg_watched"] = ",".join(cfg["watched_tickers"])
+            st.rerun()
+    
     if st.button("📨 Test Telegram connection"):
-        from telegram_alerts import send_telegram_message
-        ok = send_telegram_message(tg_token, tg_chat_id, "✅ PSAR Analyzer connected!")
-        st.success("Message sent!") if ok else st.error("Failed — check token/chat ID")
+        if not tg_token or not tg_chat_id:
+            st.error("⚠️ Enter both Bot Token and Chat ID first.")
+        else:
+            with st.spinner("Sending..."):
+                ok, err = send_telegram_message(
+                    tg_token, tg_chat_id, "✅ PSAR Analyzer connected!"
+                )
+            if ok:
+                st.success("✅ Message sent! Check your Telegram.")
+            else:
+                st.error(f"❌ Failed: {err}")
     
     st.divider()
 
@@ -521,6 +580,35 @@ with st.sidebar:
     st.divider()
     st.caption(f"Cache location: `{DATA_DIR.resolve()}`")
 
+    st.divider()
+    st.subheader("⏰ Auto-Refresh")
+    
+    last_refresh = get_last_refresh_time(DATA_DIR)
+    st.caption(f"Last auto-refresh: **{last_refresh}**")
+    
+    refresh_time_input = st.time_input(
+        "Daily refresh time (local)",
+        value=dt.time(18, 0),
+        help="Runs once daily after market close. Restart app to apply changes."
+    )
+    
+    st.caption(f"Scheduled for: **{refresh_time_input.strftime('%H:%M')}** daily")
+    
+    # Live countdown to next refresh
+    now = dt.datetime.now()
+    next_run = now.replace(
+        hour=refresh_time_input.hour,
+        minute=refresh_time_input.minute,
+        second=0, microsecond=0
+    )
+    if next_run < now:
+        next_run += dt.timedelta(days=1)
+    
+    delta = next_run - now
+    hours, remainder = divmod(int(delta.total_seconds()), 3600)
+    minutes = remainder // 60
+    st.info(f"⏳ Next refresh in: **{hours}h {minutes}m**")
+
 # ============================================================================
 # MAIN CONTENT
 # ============================================================================
@@ -528,6 +616,14 @@ with st.sidebar:
 if not tickers:
     st.warning("Please enter at least one ticker symbol in the sidebar.")
     st.stop()
+
+# ── Auto-scheduler (starts once per process) ──────────────────────────────
+start_scheduler(
+    tickers=tickers,
+    data_dir=DATA_DIR,
+    fetch_fn=load_or_fetch_ticker,
+    refresh_time="18:00"   # ← change to your preferred time (after market close)
+)
 
 # --- Load data ---
 with st.spinner(f"Loading data for {len(tickers)} ticker(s)..."):
@@ -675,6 +771,13 @@ else:
                     file_name=f"{t}_psar_data.csv",
                     mime="text/csv"
                 )
+
+# Auto-rerun the UI periodically so fresh data appears without manual refresh
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+
+# Recheck every 5 minutes (300,000 ms) — lightweight, just re-reads CSVs
+st_autorefresh(interval=300_000, key="auto_ui_refresh")
 
 # ============================================================================
 # FOOTER

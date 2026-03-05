@@ -1,0 +1,5 @@
+token=8514749939:AAGD4TEBL6vbm9bWRY8hvuWDfD8FXsVK3k8
+chat_id=299697307
+alert_on_flip=True
+alert_on_signal=False
+watched_tickers=AAPL,IWDA.AS
