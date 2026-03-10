@@ -1,0 +1,28 @@
+[supervisord]
+nodaemon=true
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+
+; ── Streamlit web UI ──────────────────────────────────────────────────────────
+[program:streamlit]
+command=streamlit run PSAR.py
+    --server.port=8502
+    --server.address=0.0.0.0
+    --server.headless=true
+    --browser.gatherUsageStats=false
+directory=/app
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/streamlit.log
+stderr_logfile=/var/log/supervisor/streamlit_err.log
+environment=PYTHONUNBUFFERED="1"
+
+; ── Standalone scheduler (Telegram alerts, no browser needed) ────────────────
+[program:scheduler]
+command=python run_scheduler.py
+directory=/app
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/scheduler.log
+stderr_logfile=/var/log/supervisor/scheduler_err.log
+environment=PYTHONUNBUFFERED="1"

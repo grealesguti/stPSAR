@@ -10,7 +10,7 @@ from pathlib import Path
 import datetime as dt
 import warnings
 from telegram_alerts import check_and_send_alerts
-from scheduler import start_scheduler, get_last_refresh_time
+from scheduler import start_scheduler, get_last_refresh_time, _run_alerts
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -441,6 +441,78 @@ def plot_psar_chart(
     return fig
 
 
+def _notna(val) -> bool:
+    try:
+        return val == val and val is not None
+    except Exception:
+        return False
+
+
+def _streak_count(df) -> int:
+    if "psar" not in df.columns or df.empty:
+        return 0
+    direction = df["psar"] < df["close"]
+    current   = direction.iloc[-1]
+    count     = 0
+    for v in reversed(direction.values):
+        if v == current: count += 1
+        else: break
+    return count
+
+
+def _format_ticker_row(ticker, df, ticker_names, alert_config) -> str:
+    """Build the detail lines for one ticker, respecting inc_* toggles."""
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2] if len(df) > 1 else last
+    name  = ticker_names.get(ticker, "")
+    label = f"*{ticker}*" + (f" — {name}" if name and name != ticker else "")
+    parts = [label]
+
+    if alert_config.get("inc_price"):
+        chg = (last["close"] - prev["close"]) / prev["close"] * 100 \
+              if prev["close"] else 0
+        parts.append(f"  💰 `{last['close']:.2f}`  `{chg:+.2f}%`")
+
+    if alert_config.get("inc_psar") and "psar" in df.columns:
+        sig = "🟢 BULL" if last["psar"] < last["close"] else "🔴 BEAR"
+        parts.append(f"  {sig}")
+
+    if alert_config.get("inc_streak") and "psar" in df.columns:
+        parts.append(f"  🔁 `{_streak_count(df)}d`")
+
+    if alert_config.get("inc_rsi") and "rsi" in df.columns:
+        rsi = last.get("rsi")
+        if _notna(rsi):
+            ob, os_ = alert_config.get("rsi_overbought", 70), \
+                      alert_config.get("rsi_oversold", 30)
+            flag = " 🔥OB" if rsi >= ob else " 🧊OS" if rsi <= os_ else ""
+            parts.append(f"  〽️ RSI `{rsi:.1f}`{flag}")
+
+    if alert_config.get("inc_vwap") and "vwap" in df.columns:
+        vwap = last.get("vwap")
+        if _notna(vwap) and vwap:
+            parts.append(f"  📉 VWAP `{(last['close']-vwap)/vwap*100:+.1f}%`")
+
+    if alert_config.get("inc_macd") and "macd_hist" in df.columns:
+        hist = last.get("macd_hist")
+        if _notna(hist):
+            parts.append(f"  📈 MACD `{hist:.4f}` {'▲' if hist > 0 else '▼'}")
+
+    return "\n".join(parts)
+
+
+def _build_summary_message(data, ticker_names, alert_config) -> str:
+    import datetime as _dt
+    header = [
+        "📊 *PSAR Dashboard Summary*",
+        f"🗓 {_dt.datetime.now().strftime('%d %b %Y  %H:%M')}",
+    ]
+    rows = [
+        _format_ticker_row(t, df, ticker_names, alert_config)
+        for t, df in data.items() if not df.empty
+    ]
+    return "\n\n".join(header + rows)
+
 # ============================================================================
 # APP LAYOUT
 # ============================================================================
@@ -448,6 +520,55 @@ def plot_psar_chart(
 st.set_page_config(page_title="📈 PSAR Analyzer", page_icon="📈", layout="wide")
 st.title("📈 Parabolic SAR Multi-Ticker Analyzer")
 st.markdown("Analyze PSAR signals across multiple tickers. All indicator parameters are configurable from the sidebar.")
+
+# ============================================================================
+# FIRST-RUN SETUP
+# ============================================================================
+
+SECRETS_FILE = Path(".streamlit/secrets.toml")
+
+def secrets_configured() -> bool:
+    if not SECRETS_FILE.exists():
+        return False
+    content = SECRETS_FILE.read_text()
+    return "telegram_token" in content and "telegram_chat_id" in content
+def save_secrets(token: str, chat_id: str):
+    SECRETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SECRETS_FILE.write_text(
+        f'telegram_token    = "{token}"\n'
+        f'telegram_chat_id  = "{chat_id}"\n'
+    )
+
+if not secrets_configured():
+    st.title("🔐 First-Time Setup")
+    st.info("Configure your Telegram bot credentials.")
+
+    with st.form("setup_form"):
+        st.subheader("🤖 Telegram Bot")
+        token   = st.text_input("Bot Token",  placeholder="110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw")
+        chat_id = st.text_input("Chat ID",    placeholder="-1001234567890")
+        st.caption("Don't have a bot yet? Talk to [@BotFather](https://t.me/BotFather) on Telegram to create one.")
+
+        submitted = st.form_submit_button("✅ Save & Continue")
+
+    if submitted:
+        errors = []
+        if not token:
+            errors.append("Bot token cannot be empty.")
+        if not chat_id:
+            errors.append("Chat ID cannot be empty.")
+
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            save_secrets(token, chat_id)
+            st.session_state["tg_token"]   = token
+            st.session_state["tg_chat_id"] = chat_id
+            st.success("Setup complete! Loading app...")
+            st.rerun()
+
+    st.stop()
 
 # ============================================================================
 # SIDEBAR
@@ -585,29 +706,100 @@ with st.sidebar:
             "tg_loaded":  True,
         })
 
-    tg_token        = st.text_input("Bot Token", type="password", value=st.session_state["tg_token"])
-    tg_chat_id      = st.text_input("Chat ID",                    value=st.session_state["tg_chat_id"])
-    alert_on_flip   = st.checkbox("🔁 Alert on signal flip",      value=st.session_state["tg_flip"])
-    alert_on_signal = st.checkbox("📅 Daily signal summary",      value=st.session_state["tg_daily"])
+        # copied from secrets
+        #token   = st.text_input("Bot Token",  placeholder="110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw")
+        #chat_id = st.text_input("Chat ID",    placeholder="-1001234567890")
+    tg_token   = st.secrets.get("telegram_token", "")
+    tg_chat_id = st.secrets.get("telegram_chat_id", "")
+    #tg_token        = st.text_input("Bot Token", type="password", value=st.session_state["tg_token"])
+    #tg_chat_id      = st.text_input("Chat ID",                    value=st.session_state["tg_chat_id"])
+    st.caption("**Trigger alerts when:**")
+    
+    alert_on_psar_flip = st.checkbox(
+        "🔁 PSAR flip (Bull ↔ Bear)",
+        value=True,
+        help="Fires once when PSAR crosses price direction.",
+    )
+    alert_on_macd_cross = st.checkbox(
+        "〰️ MACD line crosses signal line",
+        value=False,
+        help="Fires on bullish or bearish MACD crossover.",
+    )
+    alert_on_rsi_extreme = st.checkbox(
+        "〽️ RSI enters extreme zone",
+        value=False,
+        help="Fires when RSI enters or exits overbought/oversold.",
+    )
+    alert_on_vwap_cross = st.checkbox(
+        "📉 Price crosses VWAP",
+        value=False,
+        help="Fires when closing price crosses the rolling VWAP.",
+    )
+    alert_on_daily = st.checkbox(
+        "📅 Daily summary (once/day at refresh time)",
+        value=False,
+    )
+    
+    # RSI thresholds — only shown when RSI alert is on
+    if alert_on_rsi_extreme:
+        c1, c2 = st.columns(2)
+        with c1:
+            rsi_ob = st.number_input("Overbought ≥", 50, 95, 70, step=1)
+        with c2:
+            rsi_os = st.number_input("Oversold ≤",   5, 50, 30, step=1)
+    else:
+        rsi_ob, rsi_os = 70, 30
+    
+    st.caption("**Include in message body:**")
+    c1, c2 = st.columns(2)
+    with c1:
+        inc_price  = st.checkbox("Price & 1D %",   value=True)
+        inc_psar   = st.checkbox("PSAR signal",     value=True)
+        inc_streak = st.checkbox("Signal streak",   value=True)
+    with c2:
+        inc_rsi    = st.checkbox("RSI value",       value=True)
+        inc_vwap   = st.checkbox("vs VWAP %",       value=True)
+        inc_macd   = st.checkbox("MACD histogram",  value=False)
     watched_input   = st.text_input("Watchlist (blank = all)",
                                     placeholder="e.g. AAPL, IWDA.AS",
                                     value=st.session_state["tg_watched"])
+
+    alert_config = {
+        # ── triggers ─────────────────────────────────────────────
+        "on_psar_flip":     alert_on_psar_flip,
+        "on_macd_cross":    alert_on_macd_cross,
+        "on_rsi_extreme":   alert_on_rsi_extreme,
+        "on_vwap_cross":    alert_on_vwap_cross,
+        "on_daily_summary": alert_on_daily,
+        # ── thresholds ────────────────────────────────────────────
+        "rsi_overbought":   rsi_ob,
+        "rsi_oversold":     rsi_os,
+        # ── message content ───────────────────────────────────────
+        "inc_price":        inc_price,
+        "inc_psar":         inc_psar,
+        "inc_streak":       inc_streak,
+        "inc_rsi":          inc_rsi,
+        "inc_vwap":         inc_vwap,
+        "inc_macd":         inc_macd,
+    }
+    
     watched_tickers = (
         [t.strip().upper() for t in watched_input.split(",") if t.strip()]
         if watched_input else None
     )
     st.session_state.update({
-        "tg_token": tg_token, "tg_chat_id": tg_chat_id,
-        "tg_flip": alert_on_flip, "tg_daily": alert_on_signal,
-        "tg_watched": watched_input,
-    })
-
+            "tg_token":   tg_token,
+            "tg_chat_id": tg_chat_id,
+            "tg_flip":    alert_on_psar_flip,
+            "tg_daily":   alert_on_daily,
+            "tg_watched": watched_input,
+        })
     colT1, colT2 = st.columns(2)
     with colT1:
         if st.button("💾 Save config"):
             save_telegram_config(token=tg_token, chat_id=tg_chat_id,
-                                 alert_on_flip=alert_on_flip, alert_on_signal=alert_on_signal,
-                                 watched_tickers=watched_tickers or [])
+                                             alert_on_flip=alert_on_psar_flip, alert_on_signal=alert_on_daily,
+                                             watched_tickers=watched_tickers or [])
             st.success("Saved!")
     with colT2:
         if st.button("🔄 Reload config"):
@@ -626,7 +818,45 @@ with st.sidebar:
             with st.spinner("Sending..."):
                 ok, err = send_telegram_message(tg_token, tg_chat_id, "✅ PSAR Analyzer connected!")
             st.success("✅ Sent!") if ok else st.error(f"❌ {err}")
-
+    
+    st.caption("Send current dashboard summary:")
+    if st.button("📤 Send summary to Telegram"):
+        if not tg_token or not tg_chat_id:
+            st.error("⚠️ Enter Bot Token and Chat ID first.")
+        elif not st.session_state.get("data"):
+            st.warning("⚠️ No data loaded yet.")
+        else:
+            lines = [f"📊 *PSAR Dashboard Summary*",
+                     f"🗓 {dt.datetime.now().strftime('%d %b %Y %H:%M')}\n"]
+    
+            for ticker, df in st.session_state["data"].items():
+                if df.empty:
+                    continue
+                last     = df.iloc[-1]
+                prev     = df.iloc[-2] if len(df) > 1 else last
+                chg_1d   = (last["close"] - prev["close"]) / prev["close"] * 100 if prev["close"] else 0
+                signal   = get_psar_signal(df)
+                streak   = get_signal_streak(df)
+                name     = st.session_state.get("ticker_names", {}).get(ticker, "")
+                rsi_val  = f"{last['rsi']:.1f}" if "rsi" in df.columns and pd.notna(last.get("rsi")) else "N/A"
+                vwap_val = (f"{((last['close']-last['vwap'])/last['vwap']*100):+.1f}%"
+                            if "vwap" in df.columns and pd.notna(last.get("vwap")) else "N/A")
+    
+                lines.append(
+                    f"*{ticker}* {('— ' + name) if name and name != ticker else ''}\n"
+                    f"  💰 `{last['close']:.2f}`  📈 `{chg_1d:+.2f}%`\n"
+                    f"  {signal}  streak `{streak}d`\n"
+                    f"  RSI `{rsi_val}`  vs VWAP `{vwap_val}`"
+                )
+    
+            msg = "\n\n".join(lines)
+            with st.spinner("Sending…"):
+                ok, err = send_telegram_message(tg_token, tg_chat_id, msg)
+            if ok:
+                st.success("✅ Summary sent!")
+            else:
+                st.error(f"❌ Failed: {err}")
+    
     st.divider()
 
     # ── Data management ──────────────────────────────────────────────────────
@@ -693,8 +923,19 @@ if not tickers:
     st.warning("Please enter at least one ticker symbol in the sidebar.")
     st.stop()
 
-start_scheduler(tickers=tickers, data_dir=DATA_DIR,
-                fetch_fn=load_or_fetch_ticker, refresh_time="18:00")
+start_scheduler(
+    tickers         = tickers,
+    data_dir        = DATA_DIR,
+    fetch_fn        = load_or_fetch_ticker,
+    refresh_time    = "18:00",
+    calculate_fn    = calculate_indicators,
+    params          = params,
+    tg_token        = tg_token,
+    tg_chat_id      = tg_chat_id,
+    alert_config    = alert_config,       # ← replaces individual flags
+    watched_tickers = watched_tickers,
+)
+
 
 with st.spinner(f"Loading data for {len(tickers)} ticker(s)..."):
     data         = {}
@@ -720,13 +961,15 @@ if failed:
     st.error(f"Could not load: {', '.join(failed)}")
 if not data:
     st.stop()
-
+    
 if st.session_state.get("tg_token") and st.session_state.get("tg_chat_id"):
-    check_and_send_alerts(
-        data=data, token=st.session_state["tg_token"],
-        chat_id=st.session_state["tg_chat_id"],
-        alert_on_flip=alert_on_flip, alert_on_signal=alert_on_signal,
-        watched_tickers=watched_tickers,
+    _run_alerts(
+        data            = data,
+        data_dir        = DATA_DIR,
+        tg_token        = st.session_state["tg_token"],
+        tg_chat_id      = st.session_state["tg_chat_id"],
+        alert_config    = alert_config,
+        watched_tickers = watched_tickers,
     )
 
 # ============================================================================

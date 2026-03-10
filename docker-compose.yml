@@ -7,8 +7,19 @@ services:
       - "8502:8502"
     volumes:
       - ./data:/app/data
+      - ./.streamlit:/app/.streamlit   # ← add this line
     environment:
       - TZ=Europe/Amsterdam
+      # Telegram — add your credentials here or in a .env file
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      # Scheduler config
+      - REFRESH_TIME=18:00
+      - ALERT_PSAR_FLIP=true
+      - ALERT_DAILY=true
+      - ALERT_MACD_CROSS=false
+      - ALERT_RSI_EXTREME=false
+      - ALERT_VWAP_CROSS=false
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8502/_stcore/health"]
       interval: 30s
